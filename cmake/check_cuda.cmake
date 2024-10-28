@@ -38,6 +38,8 @@ if(USE_CUDA AND CMAKE_CUDA_COMPILER)
   # set(CUDA_PROPAGATE_HOST_FLAGS ON)
 
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcudafe --diag_suppress=2803 --expt-relaxed-constexpr")
+  # Enable CUDA debugging
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -w -Xptxas=\"-suppress-stack-size-warning\"")
 
   file(GLOB generator_cudalib_srcs CONFIGURE_DEPENDS
     "${GENERATORS_ROOT}/cuda/*.cpp"

@@ -22,7 +22,7 @@ import textwrap
 
 
 class Model:
-    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options): 
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         self.context_length = config.seq_length if hasattr(config, "seq_length") else config.max_position_embeddings
         self.original_context_length = config.original_max_position_embeddings if hasattr(config, "original_max_position_embeddings") else config.rope_scaling["original_max_position_embeddings"] if hasattr(config, "rope_scaling") and hasattr(config.rope_scaling, "original_max_position_embeddings") else self.context_length
         self.window_size = config.sliding_window if hasattr(config, "sliding_window") else -1  # default is -1 in GroupQueryAttention kernel
@@ -590,7 +590,7 @@ class Model:
         output = f"{name}/output_0"
         self.make_node("Greater", inputs=inputs, outputs=[output], name=name)
         self.make_value_info(output, TensorProto.BOOL, shape=shape)
-    
+
     def make_greater_or_equal(self, name, inputs, shape):
         output = f"{name}/output_0"
         self.make_node("GreaterOrEqual", inputs=inputs, outputs=[output], name=name)
@@ -683,7 +683,7 @@ class Model:
         else:
             # For regular `MatMul`
             return self.make_matmul_op(matmul, basename, root_input, **kwargs)
-    
+
     def make_matmul_op(self, matmul, basename, root_input, **kwargs):
         if self.onnx_dtype in {"fp16", "fp32"}:
             return self.make_matmul_fp16_or_fp32(matmul, basename, root_input, **kwargs)
@@ -954,8 +954,32 @@ class Model:
         self.layernorm_attrs["skip_input"] = layernorm_attrs_value
 
     def make_layernorm(self, layer_id, layernorm, skip, simple, location):
+        # Make the additional subgrah:
+        # in case of fp32:
+        # -- [input] --> layernorm --> [output]
+        # -- [skip]  -->|          |-> [input_skip_bias]
+        #  ......    -->|          |-> ...
+        # in case of fp16:
+        # -- [Input] --> Cast --> layernorm --> Cast --> [OUTPUT]
+        # -- [Skip]  --> Cast --|           |-> Cast --> [input_skip_bias]
+        # -- ...     --> Cast --|           |-> Cast -->
+        # similar for
+        # cast_1_name = f"{basename}/Cast_1"
+        # self.make_cast(cast_1_name, f"{expand_name}/output_0", dtype=self.io_dtype, shape=["unk", "unk", "unk", "unk"])
+        # sub_name = f"{basename}/Sub"
+        # sub_inputs = [f"/model/constants/{self.to_str_dtype[self.io_dtype]}/0D/1", f"{cast_1_name}/output_0"]
+        # self.make_sub(sub_name, sub_inputs, dtype=self.io_dtype, shape=["unk", "unk", "unk", "unk"])
+        # cast_2_name = f"{basename}/Cast_2"
+        # self.make_cast(cast_2_name, f"{sub_name}/output_0", dtype=TensorProto.BOOL, shape=["unk", "unk", "unk", "unk"])
+
+        cast_to_fp32 = not self.io_dtype == "fp32"
+        cast_to_fp32 = False
+        fp32_dtype = [k for k, v in self.to_str_dtype.items() if v == "TensorProto.FLOAT"][0]
+
         root_input = self.layernorm_attrs["root_input"]
         skip_input = self.layernorm_attrs["skip_input"]
+
+        _BASENAME = f"/model/layers.{layer_id}/{location}_layernorm"
 
         weight = f"model.layers.{layer_id}.{location}_layernorm.weight"
         self.make_external_tensor(layernorm.weight.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]) + self.layernorm_attrs["add_offset"], weight)
@@ -963,9 +987,34 @@ class Model:
         if not simple:
             self.make_external_tensor(layernorm.bias.detach().numpy().astype(self.to_numpy_dtype[self.io_dtype]), bias)
 
-        inputs = [root_input, skip_input, weight] if skip else [root_input, weight]
+        if skip:
+            inputs = [root_input, skip_input, weight]
+        else:
+            inputs = [root_input, weight]
         if not simple:
             inputs.append(bias)
+
+        if cast_to_fp32:
+            # Casting all inputs (including weights for now) to fp32
+            # We save the outputs to be used later
+            to_cast = {
+                "Input": (root_input, ['batch_size', 'sequence_length', self.hidden_size]),
+                "Weight": (weight, [self.hidden_size]),
+            }
+            if skip:
+                input_edge_order = ["Input", "Skip", "Weight"]
+                to_cast["Skip"] = (skip_input, ['batch_size', 'sequence_length', self.hidden_size])
+            else:
+                input_edge_order = ["Input", "Weight"]
+            if not simple:
+                to_cast["Bias"] = (bias, [self.hidden_size])
+                input_edge_order.append("Bias")
+            cast_outputs = {}
+            for edge_easy_name, (edge_input, shape) in to_cast.items():
+                edge_to_cast_name = f"{_BASENAME}/CastTofp32{edge_easy_name}"
+                # output derived from name
+                cast_outputs[edge_easy_name] = f"{edge_to_cast_name}/output_0"
+                self.make_cast(edge_to_cast_name, edge_input, dtype=fp32_dtype, shape=shape)
 
         name = f"/model/layers.{layer_id}/{location}_layernorm/{'Skip' if skip else ''}LayerNorm"
         op_type = f"{'Skip' if skip else ''}{'Simplified' if simple else ''}LayerNormalization"
@@ -979,10 +1028,29 @@ class Model:
             output_0 = "hidden_states"
         outputs = [output_0, "", "", output_3] if skip and not self.layernorm_attrs["last_layernorm"] else [output_0]
 
+        if cast_to_fp32:
+            # We need the cast outputs as inputs
+            inputs = [cast_outputs[edge_easy_name] for edge_easy_name in input_edge_order]
+
         self.make_node(op_type, inputs=inputs, outputs=outputs, name=name, domain=("com.microsoft" if skip else None), **kwargs)
-        self.make_value_info(output_0, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+        if cast_to_fp32:
+            io_dtype = fp32_dtype
+        else:
+            io_dtype = self.io_dtype
+        self.make_value_info(output_0, io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
         if skip and not self.layernorm_attrs["last_layernorm"]:
-            self.make_value_info(output_3, self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+            self.make_value_info(output_3, io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+
+        if cast_to_fp32:
+            # we now castthe output back to the original dtype
+            edge_from_cast_name = f"{_BASENAME}/CastFromfp32Output0"
+            self.make_cast(edge_from_cast_name, output_0, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+            # renaming after cast!
+            output_0 = f"{edge_from_cast_name}/output_0"
+            if skip and not self.layernorm_attrs["last_layernorm"]:
+                edge_from_cast_name = f"{_BASENAME}/CastFromfp32Output3"
+                self.make_cast(edge_from_cast_name, output_3, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.hidden_size])
+                output_3 = f"{edge_from_cast_name}/output_0"
 
         # Update LayerNorm attributes
         self.layernorm_attrs["output_0"] = output_0
@@ -2034,7 +2102,7 @@ class Model:
                 # SkipLayerNorm after last decoder layer (MatMul --> SkipLayerNorm)
                 print("Reading final norm")
                 self.make_layernorm(self.layer_id, module, skip=True, simple=self.layernorm_attrs["simple"], location="final_norm")
-            
+
             elif (isinstance(module, torch.nn.Linear) and module.out_features == self.vocab_size) or (hasattr(model, "lm_head") and module == model.lm_head):
                 # Checks (Hugging Face logic) or (GGUF logic)
                 if not self.exclude_lm_head:
@@ -2670,7 +2738,7 @@ class Phi3Mini128KModel(Phi3Mini4KModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
         self.make_rotary_embedding_multi_cache()
-   
+
     def make_position_ids_reformatting(self):
         if self.ep != "dml":
             position_ids_input_to_rotemb = super().make_position_ids_reformatting()
@@ -2693,7 +2761,7 @@ class Phi3Mini128KModel(Phi3Mini4KModel):
         self.make_add(add_1_name, add_1_inputs, dtype=TensorProto.INT64, shape=["batch_size", "sequence_length"])
 
         return add_1_name
-        
+
     def make_rotary_embedding_caches(self, rotemb, **kwargs):
         if self.ep != "dml":
             cos_cache_name, sin_cache_name = super().make_rotary_embedding_caches(rotemb, **kwargs)
